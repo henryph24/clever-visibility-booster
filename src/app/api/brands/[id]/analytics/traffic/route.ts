@@ -1,25 +1,38 @@
-import { requireAuth } from '@/lib/auth-utils';
-import { prisma } from '@/lib/db';
+import { createClient } from '@/lib/supabase/server';
 import { NextResponse } from 'next/server';
 
 export async function GET(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
-    const user = await requireAuth();
+    const supabase = await createClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
     const { id: brandId } = await params;
     const url = new URL(req.url);
     const days = parseInt(url.searchParams.get('days') || '30', 10);
 
-    const brand = await prisma.brand.findFirst({
-      where: { id: brandId, userId: user.id },
-    });
+    // Check brand ownership
+    const { data: brand } = await supabase
+      .from('brands')
+      .select('id')
+      .eq('id', brandId)
+      .eq('user_id', user.id)
+      .single();
 
     if (!brand) {
       return NextResponse.json({ error: 'Brand not found' }, { status: 404 });
     }
 
-    const connection = await prisma.analyticsConnection.findUnique({
-      where: { brandId },
-    });
+    const { data: connection } = await supabase
+      .from('analytics_connections')
+      .select('last_sync_at')
+      .eq('brand_id', brandId)
+      .single();
 
     if (!connection) {
       return NextResponse.json(
@@ -31,58 +44,12 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
     const startDate = new Date();
     startDate.setDate(startDate.getDate() - days);
 
-    // Get traffic data by source
-    const trafficBySource = await prisma.aITrafficData.groupBy({
-      by: ['source'],
-      where: {
-        brandId,
-        date: { gte: startDate },
-      },
-      _sum: {
-        sessions: true,
-        users: true,
-        engagedSessions: true,
-        conversions: true,
-        revenue: true,
-      },
-    });
-
-    // Get traffic data by date for trends
-    const trafficByDate = await prisma.aITrafficData.groupBy({
-      by: ['date'],
-      where: {
-        brandId,
-        date: { gte: startDate },
-      },
-      _sum: {
-        sessions: true,
-        users: true,
-        conversions: true,
-        revenue: true,
-      },
-      orderBy: {
-        date: 'asc',
-      },
-    });
-
-    // Get totals
-    const totals = await prisma.aITrafficData.aggregate({
-      where: {
-        brandId,
-        date: { gte: startDate },
-      },
-      _sum: {
-        sessions: true,
-        users: true,
-        engagedSessions: true,
-        conversions: true,
-        revenue: true,
-      },
-      _avg: {
-        bounceRate: true,
-        avgSessionDuration: true,
-      },
-    });
+    // Fetch all traffic data for the period
+    const { data: trafficData } = await supabase
+      .from('ai_traffic_data')
+      .select('*')
+      .eq('brand_id', brandId)
+      .gte('date', startDate.toISOString());
 
     // Format source data with friendly names
     const sourceNameMap: Record<string, string> = {
@@ -100,29 +67,103 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
       'character.ai': 'Character.AI',
     };
 
-    const bySource = trafficBySource.map((item) => ({
-      source: item.source,
-      displayName: sourceNameMap[item.source] || item.source,
-      sessions: item._sum.sessions || 0,
-      users: item._sum.users || 0,
-      engagedSessions: item._sum.engagedSessions || 0,
-      conversions: item._sum.conversions || 0,
-      revenue: item._sum.revenue || 0,
-      engagementRate: item._sum.sessions
-        ? ((item._sum.engagedSessions || 0) / item._sum.sessions) * 100
-        : 0,
-      conversionRate: item._sum.sessions
-        ? ((item._sum.conversions || 0) / item._sum.sessions) * 100
-        : 0,
+    // Group by source
+    const sourceGroups = new Map<
+      string,
+      {
+        sessions: number;
+        users: number;
+        engagedSessions: number;
+        conversions: number;
+        revenue: number;
+      }
+    >();
+
+    // Group by date
+    const dateGroups = new Map<
+      string,
+      { sessions: number; users: number; conversions: number; revenue: number }
+    >();
+
+    // Calculate totals
+    let totalSessions = 0;
+    let totalUsers = 0;
+    let totalEngagedSessions = 0;
+    let totalConversions = 0;
+    let totalRevenue = 0;
+    let bounceRateSum = 0;
+    let bounceRateCount = 0;
+    let durationSum = 0;
+    let durationCount = 0;
+
+    for (const row of trafficData || []) {
+      // Aggregate by source
+      const sourceData = sourceGroups.get(row.source) || {
+        sessions: 0,
+        users: 0,
+        engagedSessions: 0,
+        conversions: 0,
+        revenue: 0,
+      };
+      sourceData.sessions += row.sessions || 0;
+      sourceData.users += row.users || 0;
+      sourceData.engagedSessions += row.engaged_sessions || 0;
+      sourceData.conversions += row.conversions || 0;
+      sourceData.revenue += row.revenue || 0;
+      sourceGroups.set(row.source, sourceData);
+
+      // Aggregate by date
+      const dateKey = new Date(row.date).toISOString().split('T')[0];
+      const dateData = dateGroups.get(dateKey) || {
+        sessions: 0,
+        users: 0,
+        conversions: 0,
+        revenue: 0,
+      };
+      dateData.sessions += row.sessions || 0;
+      dateData.users += row.users || 0;
+      dateData.conversions += row.conversions || 0;
+      dateData.revenue += row.revenue || 0;
+      dateGroups.set(dateKey, dateData);
+
+      // Totals
+      totalSessions += row.sessions || 0;
+      totalUsers += row.users || 0;
+      totalEngagedSessions += row.engaged_sessions || 0;
+      totalConversions += row.conversions || 0;
+      totalRevenue += row.revenue || 0;
+
+      if (row.bounce_rate !== null) {
+        bounceRateSum += row.bounce_rate;
+        bounceRateCount++;
+      }
+      if (row.avg_session_duration !== null) {
+        durationSum += row.avg_session_duration;
+        durationCount++;
+      }
+    }
+
+    const bySource = Array.from(sourceGroups.entries()).map(([source, data]) => ({
+      source,
+      displayName: sourceNameMap[source] || source,
+      sessions: data.sessions,
+      users: data.users,
+      engagedSessions: data.engagedSessions,
+      conversions: data.conversions,
+      revenue: data.revenue,
+      engagementRate: data.sessions ? (data.engagedSessions / data.sessions) * 100 : 0,
+      conversionRate: data.sessions ? (data.conversions / data.sessions) * 100 : 0,
     }));
 
-    const trends = trafficByDate.map((item) => ({
-      date: item.date.toISOString().split('T')[0],
-      sessions: item._sum.sessions || 0,
-      users: item._sum.users || 0,
-      conversions: item._sum.conversions || 0,
-      revenue: item._sum.revenue || 0,
-    }));
+    const trends = Array.from(dateGroups.entries())
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([date, data]) => ({
+        date,
+        sessions: data.sessions,
+        users: data.users,
+        conversions: data.conversions,
+        revenue: data.revenue,
+      }));
 
     return NextResponse.json({
       period: {
@@ -131,22 +172,19 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
         days,
       },
       totals: {
-        sessions: totals._sum.sessions || 0,
-        users: totals._sum.users || 0,
-        engagedSessions: totals._sum.engagedSessions || 0,
-        conversions: totals._sum.conversions || 0,
-        revenue: totals._sum.revenue || 0,
-        avgBounceRate: totals._avg.bounceRate,
-        avgSessionDuration: totals._avg.avgSessionDuration,
+        sessions: totalSessions,
+        users: totalUsers,
+        engagedSessions: totalEngagedSessions,
+        conversions: totalConversions,
+        revenue: totalRevenue,
+        avgBounceRate: bounceRateCount > 0 ? bounceRateSum / bounceRateCount : null,
+        avgSessionDuration: durationCount > 0 ? durationSum / durationCount : null,
       },
       bySource,
       trends,
-      lastSyncAt: connection.lastSyncAt,
+      lastSyncAt: connection.last_sync_at,
     });
   } catch (error) {
-    if (error instanceof Error && error.message === 'Unauthorized') {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    }
     console.error('Failed to fetch traffic data:', error);
     return NextResponse.json({ error: 'Failed to fetch traffic data' }, { status: 500 });
   }

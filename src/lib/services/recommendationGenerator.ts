@@ -1,4 +1,4 @@
-import { prisma } from '@/lib/db';
+import { supabaseAdmin } from '@/lib/supabase/admin';
 
 export type RecommendationType = 'content' | 'technical' | 'outreach' | 'competitor';
 export type RecommendationPriority = 'high' | 'medium' | 'low';
@@ -44,10 +44,11 @@ export class RecommendationGenerator {
     const recommendations: RecommendationData[] = [];
 
     // Fetch brand with competitors
-    const brand = await prisma.brand.findUnique({
-      where: { id: brandId },
-      include: { competitors: true },
-    });
+    const { data: brand } = await supabaseAdmin
+      .from('brands')
+      .select('*, competitors (*)')
+      .eq('id', brandId)
+      .single();
 
     if (!brand) return [];
 
@@ -117,18 +118,23 @@ export class RecommendationGenerator {
     brandId: string,
     brandName: string
   ): Promise<TopicVisibility[]> {
-    const topics = await prisma.topic.findMany({
-      where: { brandId },
-      include: {
-        prompts: {
-          include: {
-            responses: {
-              include: { mentions: true },
-            },
-          },
-        },
-      },
-    });
+    const { data: topics } = await supabaseAdmin
+      .from('topics')
+      .select(
+        `
+        *,
+        prompts (
+          *,
+          llm_responses (
+            *,
+            brand_mentions (*)
+          )
+        )
+      `
+      )
+      .eq('brand_id', brandId);
+
+    if (!topics) return [];
 
     const results: TopicVisibility[] = [];
     const lowerBrand = brandName.toLowerCase();
@@ -137,10 +143,13 @@ export class RecommendationGenerator {
       let totalPrompts = 0;
       let mentionedPrompts = 0;
 
-      for (const prompt of topic.prompts) {
+      for (const prompt of topic.prompts || []) {
         totalPrompts++;
-        const hasBrandMention = prompt.responses.some((r) =>
-          r.mentions.some((m) => m.brandName.toLowerCase() === lowerBrand && m.brandId !== null)
+        const hasBrandMention = (prompt.llm_responses || []).some(
+          (r: { brand_mentions?: { brand_name: string; brand_id: string | null }[] }) =>
+            (r.brand_mentions || []).some(
+              (m) => m.brand_name.toLowerCase() === lowerBrand && m.brand_id !== null
+            )
         );
         if (hasBrandMention) mentionedPrompts++;
       }
@@ -164,22 +173,23 @@ export class RecommendationGenerator {
 
   private async findContentGaps(brandId: string, brandName: string): Promise<ContentGap[]> {
     // Find sources that cite competitors but not brand
-    const sources = await prisma.citedSource.findMany({
-      where: {
-        response: {
-          prompt: {
-            topic: { brandId },
-          },
-        },
-      },
-      include: {
-        response: {
-          include: {
-            mentions: true,
-          },
-        },
-      },
-    });
+    const { data: sources } = await supabaseAdmin
+      .from('cited_sources')
+      .select(
+        `
+        *,
+        llm_responses!inner (
+          *,
+          brand_mentions (*),
+          prompts!inner (
+            topics!inner (brand_id)
+          )
+        )
+      `
+      )
+      .eq('llm_responses.prompts.topics.brand_id', brandId);
+
+    if (!sources) return [];
 
     const gapMap = new Map<
       string,
@@ -188,10 +198,13 @@ export class RecommendationGenerator {
     const lowerBrand = brandName.toLowerCase();
 
     for (const source of sources) {
-      const hasBrand = source.response.mentions.some(
-        (m) => m.brandName.toLowerCase() === lowerBrand
+      const response = source.llm_responses;
+      const hasBrand = (response?.brand_mentions || []).some(
+        (m: { brand_name: string }) => m.brand_name.toLowerCase() === lowerBrand
       );
-      const competitorMentions = source.response.mentions.filter((m) => m.competitorId !== null);
+      const competitorMentions = (response?.brand_mentions || []).filter(
+        (m: { competitor_id: string | null }) => m.competitor_id !== null
+      );
 
       if (!hasBrand && competitorMentions.length > 0) {
         const existing = gapMap.get(source.domain) || {
@@ -201,7 +214,9 @@ export class RecommendationGenerator {
           count: 0,
         };
 
-        competitorMentions.forEach((m) => existing.competitors.add(m.brandName));
+        competitorMentions.forEach((m: { brand_name: string }) =>
+          existing.competitors.add(m.brand_name)
+        );
         existing.count++;
         gapMap.set(source.domain, existing);
       }
@@ -219,37 +234,45 @@ export class RecommendationGenerator {
   }
 
   private async findCompetitorWins(brandId: string, brandName: string): Promise<CompetitorWin[]> {
-    const responses = await prisma.lLMResponse.findMany({
-      where: {
-        prompt: {
-          topic: { brandId },
-        },
-      },
-      include: {
-        prompt: true,
-        mentions: true,
-      },
-    });
+    const { data: responses } = await supabaseAdmin
+      .from('llm_responses')
+      .select(
+        `
+        *,
+        prompts!inner (
+          *,
+          topics!inner (brand_id)
+        ),
+        brand_mentions (*)
+      `
+      )
+      .eq('prompts.topics.brand_id', brandId);
+
+    if (!responses) return [];
 
     const wins: CompetitorWin[] = [];
     const lowerBrand = brandName.toLowerCase();
 
     for (const response of responses) {
-      const brandMention = response.mentions.find((m) => m.brandName.toLowerCase() === lowerBrand);
-      const competitorMentions = response.mentions.filter(
-        (m) => m.competitorId !== null && m.rankPosition !== null
+      const mentions = response.brand_mentions || [];
+      const brandMention = mentions.find(
+        (m: { brand_name: string }) => m.brand_name.toLowerCase() === lowerBrand
+      );
+      const competitorMentions = mentions.filter(
+        (m: { competitor_id: string | null; rank_position: number | null }) =>
+          m.competitor_id !== null && m.rank_position !== null
       );
 
       for (const competitor of competitorMentions) {
-        const theirRank = competitor.rankPosition!;
-        const yourRank = brandMention?.rankPosition || null;
+        const theirRank = competitor.rank_position!;
+        const yourRank = brandMention?.rank_position || null;
 
         // Competitor wins if they have better rank or we're not mentioned
         if (!yourRank || theirRank < yourRank) {
           wins.push({
-            promptId: response.promptId,
-            promptText: response.prompt.text,
-            competitor: competitor.brandName,
+            promptId: response.prompt_id,
+            promptText: response.prompts.text,
+            competitor: competitor.brand_name,
             theirRank,
             yourRank,
           });
@@ -276,7 +299,11 @@ export class RecommendationGenerator {
     const recommendations: RecommendationData[] = [];
 
     // Check if brand has topics
-    const topicCount = await prisma.topic.count({ where: { brandId } });
+    const { count: topicCount } = await supabaseAdmin
+      .from('topics')
+      .select('*', { count: 'exact', head: true })
+      .eq('brand_id', brandId);
+
     if (topicCount === 0) {
       recommendations.push({
         type: 'technical',
@@ -293,18 +320,22 @@ export class RecommendationGenerator {
     }
 
     // Check for recent scans
-    const recentResponses = await prisma.lLMResponse.findFirst({
-      where: {
-        prompt: {
-          topic: { brandId },
-        },
-        createdAt: {
-          gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000), // Last 7 days
-        },
-      },
-    });
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const { data: recentResponses } = await supabaseAdmin
+      .from('llm_responses')
+      .select(
+        `
+        id,
+        prompts!inner (
+          topics!inner (brand_id)
+        )
+      `
+      )
+      .eq('prompts.topics.brand_id', brandId)
+      .gte('created_at', sevenDaysAgo)
+      .limit(1);
 
-    if (!recentResponses && topicCount > 0) {
+    if ((!recentResponses || recentResponses.length === 0) && topicCount && topicCount > 0) {
       recommendations.push({
         type: 'technical',
         priority: 'medium',
@@ -324,27 +355,26 @@ export class RecommendationGenerator {
 
   async saveRecommendations(brandId: string, recommendations: RecommendationData[]) {
     // Clear old pending recommendations
-    await prisma.recommendation.deleteMany({
-      where: {
-        brandId,
-        status: 'PENDING',
-      },
-    });
+    await supabaseAdmin
+      .from('recommendations')
+      .delete()
+      .eq('brand_id', brandId)
+      .eq('status', 'PENDING');
 
     // Create new recommendations
-    await prisma.recommendation.createMany({
-      data: recommendations.map((rec) => ({
-        brandId,
-        type: rec.type.toUpperCase() as 'CONTENT' | 'TECHNICAL' | 'OUTREACH' | 'COMPETITOR',
-        priority: rec.priority.toUpperCase() as 'HIGH' | 'MEDIUM' | 'LOW',
-        title: rec.title,
-        description: rec.description,
-        impact: rec.impact,
-        actionType: rec.action.type,
-        actionLabel: rec.action.label,
-        actionData: rec.action.data ? JSON.parse(JSON.stringify(rec.action.data)) : undefined,
-      })),
-    });
+    const insertData = recommendations.map((rec) => ({
+      brand_id: brandId,
+      type: rec.type.toUpperCase() as 'CONTENT' | 'TECHNICAL' | 'OUTREACH' | 'COMPETITOR',
+      priority: rec.priority.toUpperCase() as 'HIGH' | 'MEDIUM' | 'LOW',
+      title: rec.title,
+      description: rec.description,
+      impact: rec.impact,
+      action_type: rec.action.type,
+      action_label: rec.action.label,
+      action_data: rec.action.data ? JSON.parse(JSON.stringify(rec.action.data)) : null,
+    }));
+
+    await supabaseAdmin.from('recommendations').insert(insertData);
   }
 }
 

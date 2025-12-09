@@ -1,27 +1,39 @@
-import { requireAuth } from '@/lib/auth-utils';
-import { prisma } from '@/lib/db';
+import { createClient } from '@/lib/supabase/server';
 import { llmQueryQueue } from '@/lib/queue';
 import { NextResponse } from 'next/server';
 
 export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
-    const user = await requireAuth();
+    const supabase = await createClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
     const { id } = await params;
 
-    const brand = await prisma.brand.findFirst({
-      where: { id, userId: user.id },
-    });
+    // Check brand ownership
+    const { data: brand } = await supabase
+      .from('brands')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', user.id)
+      .single();
 
     if (!brand) {
       return NextResponse.json({ error: 'Brand not found' }, { status: 404 });
     }
 
-    const prompts = await prisma.prompt.findMany({
-      where: { topic: { brandId: id } },
-      select: { id: true },
-    });
+    // Get prompts for this brand
+    const { data: prompts } = await supabase
+      .from('prompts')
+      .select('id, topics!inner(brand_id)')
+      .eq('topics.brand_id', id);
 
-    if (prompts.length === 0) {
+    if (!prompts || prompts.length === 0) {
       return NextResponse.json(
         { error: 'No prompts configured. Add topics and prompts first.' },
         { status: 400 }
@@ -49,9 +61,6 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       message: 'Scan started',
     });
   } catch (error) {
-    if (error instanceof Error && error.message === 'Unauthorized') {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    }
     console.error('Failed to start scan:', error);
     return NextResponse.json({ error: 'Failed to start scan' }, { status: 500 });
   }

@@ -1,12 +1,14 @@
-import { getServerSession } from 'next-auth';
+import { createClient } from '@/lib/supabase/server';
 import { NextResponse } from 'next/server';
-import { authOptions } from '@/lib/auth';
-import { prisma } from '@/lib/db';
 
 export async function GET(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.id) {
+    const supabase = await createClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+
+    if (!user) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
@@ -14,10 +16,13 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
     const { searchParams } = new URL(req.url);
     const days = parseInt(searchParams.get('days') || '30');
 
-    const brand = await prisma.brand.findUnique({
-      where: { id, userId: session.user.id },
-      include: { competitors: true },
-    });
+    // Check brand ownership
+    const { data: brand } = await supabase
+      .from('brands')
+      .select('id, name, competitors (*)')
+      .eq('id', id)
+      .eq('user_id', user.id)
+      .single();
 
     if (!brand) {
       return NextResponse.json({ error: 'Brand not found' }, { status: 404 });
@@ -27,32 +32,43 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
     startDate.setDate(startDate.getDate() - days);
 
     // Get visibility metrics over time
-    const metrics = await prisma.visibilityMetric.findMany({
-      where: {
-        brandId: id,
-        date: { gte: startDate },
-      },
-      orderBy: { date: 'asc' },
-    });
+    const { data: metrics } = await supabase
+      .from('visibility_metrics')
+      .select('*')
+      .eq('brand_id', id)
+      .gte('date', startDate.toISOString())
+      .order('date', { ascending: true });
 
     // If no stored metrics, generate from responses
-    if (metrics.length === 0) {
-      const responses = await prisma.lLMResponse.findMany({
-        where: {
-          prompt: { topic: { brandId: id } },
-          createdAt: { gte: startDate },
-        },
-        include: { mentions: true },
-        orderBy: { createdAt: 'asc' },
-      });
+    if (!metrics || metrics.length === 0) {
+      // Get responses with mentions for this brand's prompts
+      const { data: responses } = await supabase
+        .from('llm_responses')
+        .select(
+          `
+          id,
+          created_at,
+          prompts!inner (
+            topics!inner (brand_id)
+          ),
+          brand_mentions (brand_id)
+        `
+        )
+        .eq('prompts.topics.brand_id', id)
+        .gte('created_at', startDate.toISOString())
+        .order('created_at', { ascending: true });
 
       // Group by date
       const byDate = new Map<string, { total: number; mentioned: number }>();
-      for (const response of responses) {
-        const dateKey = response.createdAt.toISOString().split('T')[0];
+      for (const response of responses || []) {
+        const dateKey = new Date(response.created_at).toISOString().split('T')[0];
         const current = byDate.get(dateKey) || { total: 0, mentioned: 0 };
         current.total++;
-        if (response.mentions.some((m) => m.brandId === id)) {
+        if (
+          (response.brand_mentions || []).some(
+            (m: { brand_id: string | null }) => m.brand_id === id
+          )
+        ) {
           current.mentioned++;
         }
         byDate.set(dateKey, current);
@@ -67,8 +83,8 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
     }
 
     const trends = metrics.map((m) => ({
-      date: m.date.toISOString().split('T')[0],
-      visibility: m.visibilityPct,
+      date: new Date(m.date).toISOString().split('T')[0],
+      visibility: m.visibility_pct,
     }));
 
     return NextResponse.json(trends);

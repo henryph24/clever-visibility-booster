@@ -1,37 +1,53 @@
-import { getServerSession } from 'next-auth';
-import { authOptions } from '@/lib/auth';
-import { prisma } from '@/lib/db';
+import { createClient } from '@/lib/supabase/server';
 import { generateCSV } from '@/lib/export/csv';
 
 export async function GET(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.id) {
+    const supabase = await createClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+
+    if (!user) {
       return new Response('Unauthorized', { status: 401 });
     }
 
     const { id } = await params;
 
-    const brand = await prisma.brand.findUnique({
-      where: { id, userId: session.user.id },
-    });
+    // Check brand ownership
+    const { data: brand } = await supabase
+      .from('brands')
+      .select('id, name')
+      .eq('id', id)
+      .eq('user_id', user.id)
+      .single();
 
     if (!brand) {
       return new Response('Brand not found', { status: 404 });
     }
 
-    const prompts = await prisma.prompt.findMany({
-      where: { topic: { brandId: id } },
-      include: {
-        topic: true,
-        responses: {
-          include: {
-            mentions: true,
-            sources: true,
-          },
-        },
-      },
-    });
+    // Get prompts with responses
+    const { data: prompts } = await supabase
+      .from('prompts')
+      .select(
+        `
+        id,
+        text,
+        created_at,
+        topics!inner (
+          name,
+          brand_id
+        ),
+        llm_responses (
+          id,
+          provider,
+          created_at,
+          brand_mentions (brand_name, rank_position),
+          cited_sources (domain)
+        )
+      `
+      )
+      .eq('topics.brand_id', id);
 
     const flatData: {
       topic: string;
@@ -40,33 +56,37 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
       mentioned: boolean;
       rank: number | null;
       citedSources: string;
-      responseDate: Date;
+      responseDate: string;
     }[] = [];
 
-    for (const prompt of prompts) {
-      if (prompt.responses.length === 0) {
+    for (const prompt of prompts || []) {
+      const responses = prompt.llm_responses || [];
+
+      if (responses.length === 0) {
         flatData.push({
-          topic: prompt.topic.name,
+          topic: prompt.topics?.name || '',
           prompt: prompt.text,
           provider: 'N/A',
           mentioned: false,
           rank: null,
           citedSources: '',
-          responseDate: prompt.createdAt,
+          responseDate: prompt.created_at,
         });
       } else {
-        for (const response of prompt.responses) {
-          const brandMention = response.mentions.find(
-            (m) => m.brandName.toLowerCase() === brand.name.toLowerCase()
+        for (const response of responses) {
+          const brandMention = (response.brand_mentions || []).find(
+            (m: { brand_name: string }) => m.brand_name.toLowerCase() === brand.name.toLowerCase()
           );
           flatData.push({
-            topic: prompt.topic.name,
+            topic: prompt.topics?.name || '',
             prompt: prompt.text,
             provider: response.provider,
             mentioned: !!brandMention,
-            rank: brandMention?.rankPosition || null,
-            citedSources: response.sources.map((s) => s.domain).join('; '),
-            responseDate: response.createdAt,
+            rank: brandMention?.rank_position || null,
+            citedSources: (response.cited_sources || [])
+              .map((s: { domain: string }) => s.domain)
+              .join('; '),
+            responseDate: response.created_at,
           });
         }
       }

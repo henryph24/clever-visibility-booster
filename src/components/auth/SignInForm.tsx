@@ -3,7 +3,7 @@
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { signIn } from 'next-auth/react';
+import { createClient } from '@/lib/supabase/client';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useState } from 'react';
@@ -22,19 +22,33 @@ export function SignInForm() {
     setLoading(true);
     setError('');
 
-    const result = await signIn('credentials', {
+    const supabase = createClient();
+    const { error } = await supabase.auth.signInWithPassword({
       email,
       password,
-      redirect: false,
     });
 
     setLoading(false);
 
-    if (result?.error) {
+    if (error) {
       setError('Invalid email or password');
     } else {
       router.push(callbackUrl);
       router.refresh();
+    }
+  };
+
+  const handleGoogleSignIn = async () => {
+    const supabase = createClient();
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: 'google',
+      options: {
+        redirectTo: `${window.location.origin}/auth/callback?next=${encodeURIComponent(callbackUrl)}`,
+      },
+    });
+
+    if (error) {
+      setError(error.message);
     }
   };
 
@@ -77,11 +91,7 @@ export function SignInForm() {
         </div>
       </div>
 
-      <Button
-        variant="outline"
-        className="w-full"
-        onClick={() => signIn('google', { callbackUrl })}
-      >
+      <Button variant="outline" className="w-full" onClick={handleGoogleSignIn}>
         <svg className="mr-2 h-4 w-4" viewBox="0 0 24 24">
           <path
             d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"

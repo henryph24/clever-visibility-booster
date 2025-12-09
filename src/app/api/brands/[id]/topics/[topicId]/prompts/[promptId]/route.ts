@@ -1,5 +1,4 @@
-import { requireAuth } from '@/lib/auth-utils';
-import { prisma } from '@/lib/db';
+import { createClient } from '@/lib/supabase/server';
 import { NextResponse } from 'next/server';
 
 export async function DELETE(
@@ -7,32 +6,51 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string; topicId: string; promptId: string }> }
 ) {
   try {
-    const user = await requireAuth();
+    const supabase = await createClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
     const { id, topicId, promptId } = await params;
 
-    const brand = await prisma.brand.findFirst({
-      where: { id, userId: user.id },
-    });
+    // Check brand ownership
+    const { data: brand } = await supabase
+      .from('brands')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', user.id)
+      .single();
 
     if (!brand) {
       return NextResponse.json({ error: 'Brand not found' }, { status: 404 });
     }
 
-    const prompt = await prisma.prompt.findFirst({
-      where: { id: promptId, topicId },
-    });
+    // Check prompt exists and belongs to this topic
+    const { data: prompt } = await supabase
+      .from('prompts')
+      .select('id')
+      .eq('id', promptId)
+      .eq('topic_id', topicId)
+      .single();
 
     if (!prompt) {
       return NextResponse.json({ error: 'Prompt not found' }, { status: 404 });
     }
 
-    await prisma.prompt.delete({ where: { id: promptId } });
+    // Delete the prompt (cascade will handle related records)
+    const { error: deleteError } = await supabase.from('prompts').delete().eq('id', promptId);
+
+    if (deleteError) {
+      console.error('Failed to delete prompt:', deleteError);
+      return NextResponse.json({ error: 'Failed to delete prompt' }, { status: 500 });
+    }
 
     return NextResponse.json({ success: true });
   } catch (error) {
-    if (error instanceof Error && error.message === 'Unauthorized') {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    }
     console.error('Failed to delete prompt:', error);
     return NextResponse.json({ error: 'Failed to delete prompt' }, { status: 500 });
   }

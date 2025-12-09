@@ -1,50 +1,67 @@
-import { getServerSession } from 'next-auth';
+import { createClient } from '@/lib/supabase/server';
 import { NextResponse } from 'next/server';
-import { authOptions } from '@/lib/auth';
-import { prisma } from '@/lib/db';
 
 export async function GET(req: Request, { params }: { params: Promise<{ promptId: string }> }) {
   try {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.id) {
+    const supabase = await createClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+
+    if (!user) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
     const { promptId } = await params;
 
-    const prompt = await prisma.prompt.findUnique({
-      where: { id: promptId },
-      include: {
-        topic: {
-          include: { brand: true },
-        },
-      },
-    });
+    // Fetch prompt with topic and brand to check ownership
+    const { data: prompt } = await supabase
+      .from('prompts')
+      .select(
+        `
+        *,
+        topics (
+          *,
+          brands (user_id)
+        )
+      `
+      )
+      .eq('id', promptId)
+      .single();
 
-    if (!prompt || prompt.topic.brand.userId !== session.user.id) {
+    if (!prompt || prompt.topics?.brands?.user_id !== user.id) {
       return NextResponse.json({ error: 'Prompt not found' }, { status: 404 });
     }
 
-    const responses = await prisma.lLMResponse.findMany({
-      where: { promptId },
-      include: {
-        mentions: true,
-        sources: true,
-      },
-      orderBy: { createdAt: 'desc' },
-    });
+    // Fetch responses with mentions and sources
+    const { data: responses, error } = await supabase
+      .from('llm_responses')
+      .select(
+        `
+        *,
+        brand_mentions (*),
+        cited_sources (*)
+      `
+      )
+      .eq('prompt_id', promptId)
+      .order('created_at', { ascending: false });
 
-    const result = responses.map((response) => ({
+    if (error) {
+      console.error('Failed to fetch responses:', error);
+      return NextResponse.json({ error: 'Failed to fetch responses' }, { status: 500 });
+    }
+
+    const result = responses?.map((response) => ({
       id: response.id,
       provider: response.provider,
-      responseText: response.responseText,
-      mentions: response.mentions.map((m) => ({
-        brandName: m.brandName,
-        rankPosition: m.rankPosition,
-        isCited: m.isCited,
+      responseText: response.response_text,
+      mentions: (response.brand_mentions || []).map((m: Record<string, unknown>) => ({
+        brandName: m.brand_name,
+        rankPosition: m.rank_position,
+        isCited: m.is_cited,
         context: m.context,
       })),
-      sources: response.sources.map((s) => ({
+      sources: (response.cited_sources || []).map((s: Record<string, unknown>) => ({
         url: s.url,
         domain: s.domain,
         title: s.title,

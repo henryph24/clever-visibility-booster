@@ -1,6 +1,6 @@
 import { Job, Worker } from 'bullmq';
 import Redis from 'ioredis';
-import { prisma } from '@/lib/db';
+import { supabaseAdmin } from '@/lib/supabase/admin';
 import { createLLMClient } from '@/lib/llm';
 import { createParser } from '@/lib/parsers';
 import { delay } from '../index';
@@ -21,14 +21,13 @@ export function createLLMQueryWorker() {
     async (job: Job<LLMQueryJobData>) => {
       const { brandId, promptIds, providers } = job.data;
 
-      const prompts = await prisma.prompt.findMany({
-        where: { id: { in: promptIds } },
-      });
+      const { data: prompts } = await supabaseAdmin.from('prompts').select('*').in('id', promptIds);
 
-      const brand = await prisma.brand.findUnique({
-        where: { id: brandId },
-        include: { competitors: true },
-      });
+      const { data: brand } = await supabaseAdmin
+        .from('brands')
+        .select('*, competitors (*)')
+        .eq('id', brandId)
+        .single();
 
       if (!brand) {
         throw new Error('Brand not found');
@@ -36,54 +35,57 @@ export function createLLMQueryWorker() {
 
       const parser = createParser(
         [brand.name],
-        brand.competitors.map((c) => c.name)
+        (brand.competitors || []).map((c: { name: string }) => c.name)
       );
 
       let processedCount = 0;
-      const totalOperations = prompts.length * providers.length;
+      const totalOperations = (prompts?.length || 0) * providers.length;
 
-      for (const prompt of prompts) {
+      for (const prompt of prompts || []) {
         for (const provider of providers) {
           try {
             const client = createLLMClient(provider);
             const result = await client.query(prompt.text);
             const parsed = parser.parse(result.response, result.citations);
 
-            const response = await prisma.lLMResponse.create({
-              data: {
-                promptId: prompt.id,
+            const { data: response, error: responseError } = await supabaseAdmin
+              .from('llm_responses')
+              .insert({
+                prompt_id: prompt.id,
                 provider,
-                responseText: result.response,
-              },
-            });
+                response_text: result.response,
+              })
+              .select()
+              .single();
+
+            if (responseError || !response) {
+              console.error('Failed to create response:', responseError);
+              continue;
+            }
 
             for (const mention of parsed.mentions) {
-              const competitor = brand.competitors.find(
-                (c) => c.name.toLowerCase() === mention.brandName.toLowerCase()
+              const competitor = (brand.competitors || []).find(
+                (c: { name: string }) => c.name.toLowerCase() === mention.brandName.toLowerCase()
               );
 
-              await prisma.brandMention.create({
-                data: {
-                  responseId: response.id,
-                  brandId:
-                    mention.brandName.toLowerCase() === brand.name.toLowerCase() ? brandId : null,
-                  competitorId: competitor?.id || null,
-                  brandName: mention.brandName,
-                  rankPosition: mention.rankPosition,
-                  isCited: mention.isCited,
-                  context: mention.context,
-                },
+              await supabaseAdmin.from('brand_mentions').insert({
+                response_id: response.id,
+                brand_id:
+                  mention.brandName.toLowerCase() === brand.name.toLowerCase() ? brandId : null,
+                competitor_id: competitor?.id || null,
+                brand_name: mention.brandName,
+                rank_position: mention.rankPosition,
+                is_cited: mention.isCited,
+                context: mention.context,
               });
             }
 
             for (const source of parsed.sources) {
-              await prisma.citedSource.create({
-                data: {
-                  responseId: response.id,
-                  url: source.url,
-                  domain: source.domain,
-                  title: source.title,
-                },
+              await supabaseAdmin.from('cited_sources').insert({
+                response_id: response.id,
+                url: source.url,
+                domain: source.domain,
+                title: source.title,
               });
             }
 

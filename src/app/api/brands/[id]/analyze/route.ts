@@ -1,28 +1,42 @@
-import { getServerSession } from 'next-auth';
+import { createClient } from '@/lib/supabase/server';
 import { NextResponse } from 'next/server';
-import { authOptions } from '@/lib/auth';
-import { prisma } from '@/lib/db';
 import { pageAnalyzer } from '@/lib/services/pageAnalyzer';
 
 export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.id) {
+    const supabase = await createClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+
+    if (!user) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
     const { id } = await params;
     const { url, content, topicId } = await req.json();
 
-    const brand = await prisma.brand.findUnique({
-      where: { id, userId: session.user.id },
-    });
+    // Check brand ownership
+    const { data: brand } = await supabase
+      .from('brands')
+      .select('id, name')
+      .eq('id', id)
+      .eq('user_id', user.id)
+      .single();
 
     if (!brand) {
       return NextResponse.json({ error: 'Brand not found' }, { status: 404 });
     }
 
-    const topic = topicId ? await prisma.topic.findUnique({ where: { id: topicId } }) : null;
+    let topic = null;
+    if (topicId) {
+      const { data: topicData } = await supabase
+        .from('topics')
+        .select('*')
+        .eq('id', topicId)
+        .single();
+      topic = topicData;
+    }
 
     const analysis = await pageAnalyzer.analyze({
       url,

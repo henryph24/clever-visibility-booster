@@ -1,5 +1,4 @@
-import { prisma } from '@/lib/db';
-import { hash } from 'bcryptjs';
+import { createClient } from '@/lib/supabase/server';
 import { NextResponse } from 'next/server';
 
 export async function POST(req: Request) {
@@ -17,28 +16,30 @@ export async function POST(req: Request) {
       );
     }
 
-    const existingUser = await prisma.user.findUnique({
-      where: { email },
-    });
+    const supabase = await createClient();
 
-    if (existingUser) {
-      return NextResponse.json({ error: 'User already exists' }, { status: 400 });
-    }
-
-    const hashedPassword = await hash(password, 12);
-
-    const user = await prisma.user.create({
-      data: {
-        name,
-        email,
-        password: hashedPassword,
+    const { data, error } = await supabase.auth.signUp({
+      email,
+      password,
+      options: {
+        data: {
+          name,
+          full_name: name,
+        },
       },
     });
 
+    if (error) {
+      if (error.message.includes('already registered')) {
+        return NextResponse.json({ error: 'User already exists' }, { status: 400 });
+      }
+      return NextResponse.json({ error: error.message }, { status: 400 });
+    }
+
     return NextResponse.json({
-      id: user.id,
-      name: user.name,
-      email: user.email,
+      id: data.user?.id,
+      name: name,
+      email: data.user?.email,
     });
   } catch (error) {
     console.error('Signup error:', error);

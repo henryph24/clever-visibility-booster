@@ -1,5 +1,4 @@
-import { requireAuth } from '@/lib/auth-utils';
-import { prisma } from '@/lib/db';
+import { createClient } from '@/lib/supabase/server';
 import { NextResponse } from 'next/server';
 
 export async function GET(
@@ -7,27 +6,50 @@ export async function GET(
   { params }: { params: Promise<{ id: string; topicId: string }> }
 ) {
   try {
-    const user = await requireAuth();
+    const supabase = await createClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
     const { id, topicId } = await params;
 
-    const brand = await prisma.brand.findFirst({
-      where: { id, userId: user.id },
-    });
+    // Check brand ownership
+    const { data: brand } = await supabase
+      .from('brands')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', user.id)
+      .single();
 
     if (!brand) {
       return NextResponse.json({ error: 'Brand not found' }, { status: 404 });
     }
 
-    const prompts = await prisma.prompt.findMany({
-      where: { topicId },
-      orderBy: { createdAt: 'desc' },
-    });
+    const { data: prompts, error } = await supabase
+      .from('prompts')
+      .select('*')
+      .eq('topic_id', topicId)
+      .order('created_at', { ascending: false });
 
-    return NextResponse.json(prompts);
-  } catch (error) {
-    if (error instanceof Error && error.message === 'Unauthorized') {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    if (error) {
+      console.error('Failed to fetch prompts:', error);
+      return NextResponse.json({ error: 'Failed to fetch prompts' }, { status: 500 });
     }
+
+    // Transform to camelCase
+    const transformed = prompts?.map((p) => ({
+      id: p.id,
+      text: p.text,
+      topicId: p.topic_id,
+      createdAt: p.created_at,
+    }));
+
+    return NextResponse.json(transformed);
+  } catch (error) {
     console.error('Failed to fetch prompts:', error);
     return NextResponse.json({ error: 'Failed to fetch prompts' }, { status: 500 });
   }
@@ -38,7 +60,15 @@ export async function POST(
   { params }: { params: Promise<{ id: string; topicId: string }> }
 ) {
   try {
-    const user = await requireAuth();
+    const supabase = await createClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
     const { id, topicId } = await params;
     const { text } = await req.json();
 
@@ -46,34 +76,54 @@ export async function POST(
       return NextResponse.json({ error: 'Text is required' }, { status: 400 });
     }
 
-    const brand = await prisma.brand.findFirst({
-      where: { id, userId: user.id },
-    });
+    // Check brand ownership
+    const { data: brand } = await supabase
+      .from('brands')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', user.id)
+      .single();
 
     if (!brand) {
       return NextResponse.json({ error: 'Brand not found' }, { status: 404 });
     }
 
-    const topic = await prisma.topic.findFirst({
-      where: { id: topicId, brandId: id },
-    });
+    // Check topic exists and belongs to brand
+    const { data: topic } = await supabase
+      .from('topics')
+      .select('id')
+      .eq('id', topicId)
+      .eq('brand_id', id)
+      .single();
 
     if (!topic) {
       return NextResponse.json({ error: 'Topic not found' }, { status: 404 });
     }
 
-    const prompt = await prisma.prompt.create({
-      data: {
+    const { data: prompt, error } = await supabase
+      .from('prompts')
+      .insert({
         text,
-        topicId,
-      },
-    });
+        topic_id: topicId,
+      })
+      .select()
+      .single();
 
-    return NextResponse.json(prompt, { status: 201 });
-  } catch (error) {
-    if (error instanceof Error && error.message === 'Unauthorized') {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    if (error) {
+      console.error('Failed to create prompt:', error);
+      return NextResponse.json({ error: 'Failed to create prompt' }, { status: 500 });
     }
+
+    // Transform to camelCase
+    const transformed = {
+      id: prompt.id,
+      text: prompt.text,
+      topicId: prompt.topic_id,
+      createdAt: prompt.created_at,
+    };
+
+    return NextResponse.json(transformed, { status: 201 });
+  } catch (error) {
     console.error('Failed to create prompt:', error);
     return NextResponse.json({ error: 'Failed to create prompt' }, { status: 500 });
   }

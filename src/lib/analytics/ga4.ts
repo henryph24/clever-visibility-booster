@@ -1,6 +1,6 @@
 import { BetaAnalyticsDataClient } from '@google-analytics/data';
 import { google } from 'googleapis';
-import { prisma } from '@/lib/db';
+import { supabaseAdmin } from '@/lib/supabase/admin';
 
 // AI sources to track - domains that indicate AI-driven traffic
 export const AI_REFERRAL_SOURCES = [
@@ -55,7 +55,7 @@ export class GA4Service {
     this.oauth2Client = new google.auth.OAuth2(
       process.env.GOOGLE_ANALYTICS_CLIENT_ID,
       process.env.GOOGLE_ANALYTICS_CLIENT_SECRET,
-      `${process.env.NEXTAUTH_URL}/api/brands/analytics/callback`
+      `${process.env.NEXT_PUBLIC_SITE_URL}/api/brands/analytics/callback`
     );
   }
 
@@ -96,34 +96,36 @@ export class GA4Service {
   }
 
   async getValidCredentials(brandId: string): Promise<GA4Credentials | null> {
-    const connection = await prisma.analyticsConnection.findUnique({
-      where: { brandId },
-    });
+    const { data: connection } = await supabaseAdmin
+      .from('analytics_connections')
+      .select('*')
+      .eq('brand_id', brandId)
+      .single();
 
     if (!connection) {
       return null;
     }
 
     // Check if token needs refresh (5 min buffer)
-    if (new Date(connection.expiresAt) <= new Date(Date.now() + 300000)) {
-      const newCredentials = await this.refreshAccessToken(connection.refreshToken);
+    if (new Date(connection.expires_at) <= new Date(Date.now() + 300000)) {
+      const newCredentials = await this.refreshAccessToken(connection.refresh_token);
 
-      await prisma.analyticsConnection.update({
-        where: { brandId },
-        data: {
-          accessToken: newCredentials.accessToken,
-          refreshToken: newCredentials.refreshToken,
-          expiresAt: newCredentials.expiresAt,
-        },
-      });
+      await supabaseAdmin
+        .from('analytics_connections')
+        .update({
+          access_token: newCredentials.accessToken,
+          refresh_token: newCredentials.refreshToken,
+          expires_at: newCredentials.expiresAt.toISOString(),
+        })
+        .eq('brand_id', brandId);
 
       return newCredentials;
     }
 
     return {
-      accessToken: connection.accessToken,
-      refreshToken: connection.refreshToken,
-      expiresAt: connection.expiresAt,
+      accessToken: connection.access_token,
+      refreshToken: connection.refresh_token,
+      expiresAt: new Date(connection.expires_at),
     };
   }
 
@@ -244,9 +246,11 @@ export class GA4Service {
   }
 
   async syncTrafficData(brandId: string): Promise<{ synced: number }> {
-    const connection = await prisma.analyticsConnection.findUnique({
-      where: { brandId },
-    });
+    const { data: connection } = await supabaseAdmin
+      .from('analytics_connections')
+      .select('*')
+      .eq('brand_id', brandId)
+      .single();
 
     if (!connection) {
       throw new Error('No analytics connection found');
@@ -263,7 +267,7 @@ export class GA4Service {
     startDate.setDate(startDate.getDate() - 30);
 
     const trafficData = await this.fetchAITrafficData(
-      connection.propertyId,
+      connection.property_id,
       credentials.accessToken,
       this.formatDateForAPI(startDate),
       this.formatDateForAPI(endDate)
@@ -272,44 +276,34 @@ export class GA4Service {
     // Upsert traffic data
     let synced = 0;
     for (const data of trafficData) {
-      await prisma.aITrafficData.upsert({
-        where: {
-          brandId_date_source: {
-            brandId,
-            date: new Date(data.date),
-            source: data.source,
-          },
-        },
-        update: {
-          sessions: data.sessions,
-          users: data.users,
-          engagedSessions: data.engagedSessions,
-          conversions: data.conversions,
-          revenue: data.revenue,
-          bounceRate: data.bounceRate,
-          avgSessionDuration: data.avgSessionDuration,
-        },
-        create: {
-          brandId,
-          date: new Date(data.date),
+      const { error } = await supabaseAdmin.from('ai_traffic_data').upsert(
+        {
+          brand_id: brandId,
+          date: data.date,
           source: data.source,
           sessions: data.sessions,
           users: data.users,
-          engagedSessions: data.engagedSessions,
+          engaged_sessions: data.engagedSessions,
           conversions: data.conversions,
           revenue: data.revenue,
-          bounceRate: data.bounceRate,
-          avgSessionDuration: data.avgSessionDuration,
+          bounce_rate: data.bounceRate,
+          avg_session_duration: data.avgSessionDuration,
         },
-      });
-      synced++;
+        {
+          onConflict: 'brand_id,date,source',
+        }
+      );
+
+      if (!error) {
+        synced++;
+      }
     }
 
     // Update last sync timestamp
-    await prisma.analyticsConnection.update({
-      where: { brandId },
-      data: { lastSyncAt: new Date() },
-    });
+    await supabaseAdmin
+      .from('analytics_connections')
+      .update({ last_sync_at: new Date().toISOString() })
+      .eq('brand_id', brandId);
 
     return { synced };
   }

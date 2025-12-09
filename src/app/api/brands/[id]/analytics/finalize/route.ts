@@ -1,12 +1,19 @@
-import { requireAuth } from '@/lib/auth-utils';
-import { prisma } from '@/lib/db';
+import { createClient } from '@/lib/supabase/server';
 import { ga4Service } from '@/lib/analytics/ga4';
 import { NextResponse } from 'next/server';
 import { cookies } from 'next/headers';
 
 export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
-    const user = await requireAuth();
+    const supabase = await createClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
     const { id: brandId } = await params;
     const { propertyId } = await req.json();
 
@@ -14,9 +21,13 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       return NextResponse.json({ error: 'Property ID is required' }, { status: 400 });
     }
 
-    const brand = await prisma.brand.findFirst({
-      where: { id: brandId, userId: user.id },
-    });
+    // Check brand ownership
+    const { data: brand } = await supabase
+      .from('brands')
+      .select('id')
+      .eq('id', brandId)
+      .eq('user_id', user.id)
+      .single();
 
     if (!brand) {
       return NextResponse.json({ error: 'Brand not found' }, { status: 404 });
@@ -40,16 +51,19 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     }
 
     // Save the analytics connection
-    await prisma.analyticsConnection.create({
-      data: {
-        brandId,
-        provider: 'GA4',
-        propertyId,
-        accessToken: tempCreds.accessToken,
-        refreshToken: tempCreds.refreshToken,
-        expiresAt: new Date(tempCreds.expiresAt),
-      },
+    const { error: insertError } = await supabase.from('analytics_connections').insert({
+      brand_id: brandId,
+      provider: 'GA4',
+      property_id: propertyId,
+      access_token: tempCreds.accessToken,
+      refresh_token: tempCreds.refreshToken,
+      expires_at: new Date(tempCreds.expiresAt).toISOString(),
     });
+
+    if (insertError) {
+      console.error('Failed to save analytics connection:', insertError);
+      return NextResponse.json({ error: 'Failed to save connection' }, { status: 500 });
+    }
 
     // Clear the temp credentials cookie
     cookieStore.delete('ga4_temp_credentials');
@@ -64,9 +78,6 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
 
     return NextResponse.json({ success: true });
   } catch (error) {
-    if (error instanceof Error && error.message === 'Unauthorized') {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    }
     console.error('Failed to finalize analytics connection:', error);
     return NextResponse.json({ error: 'Failed to finalize connection' }, { status: 500 });
   }

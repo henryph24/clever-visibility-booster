@@ -1,37 +1,47 @@
-import { getServerSession } from 'next-auth';
-import { authOptions } from '@/lib/auth';
-import { prisma } from '@/lib/db';
+import { createClient } from '@/lib/supabase/server';
 import { generateCSV } from '@/lib/export/csv';
 
 export async function GET(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.id) {
+    const supabase = await createClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+
+    if (!user) {
       return new Response('Unauthorized', { status: 401 });
     }
 
     const { id } = await params;
 
-    const brand = await prisma.brand.findUnique({
-      where: { id, userId: session.user.id },
-    });
+    // Check brand ownership
+    const { data: brand } = await supabase
+      .from('brands')
+      .select('id, name')
+      .eq('id', id)
+      .eq('user_id', user.id)
+      .single();
 
     if (!brand) {
       return new Response('Brand not found', { status: 404 });
     }
 
-    const sources = await prisma.citedSource.findMany({
-      where: {
-        response: { prompt: { topic: { brandId: id } } },
-      },
-      include: {
-        response: {
-          include: {
-            mentions: true,
-          },
-        },
-      },
-    });
+    // Get cited sources for this brand's prompts
+    const { data: sources } = await supabase
+      .from('cited_sources')
+      .select(
+        `
+        *,
+        llm_responses!inner (
+          id,
+          prompts!inner (
+            topics!inner (brand_id)
+          ),
+          brand_mentions (brand_id, competitor_id)
+        )
+      `
+      )
+      .eq('llm_responses.prompts.topics.brand_id', id);
 
     const domainStats = new Map<
       string,
@@ -44,7 +54,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
       }
     >();
 
-    for (const source of sources) {
+    for (const source of sources || []) {
       const existing = domainStats.get(source.domain) || {
         domain: source.domain,
         totalCitations: 0,
@@ -56,10 +66,12 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
       existing.totalCitations++;
       existing.uniqueUrls.add(source.url);
 
-      if (source.response.mentions.some((m) => m.brandId === id)) {
+      const mentions = source.llm_responses?.brand_mentions || [];
+
+      if (mentions.some((m: { brand_id: string | null }) => m.brand_id === id)) {
         existing.mentionsYourBrand++;
       }
-      if (source.response.mentions.some((m) => m.competitorId !== null)) {
+      if (mentions.some((m: { competitor_id: string | null }) => m.competitor_id !== null)) {
         existing.mentionsCompetitors++;
       }
 
