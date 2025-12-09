@@ -1,28 +1,30 @@
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import { GoogleGenAI } from '@google/genai';
 import { Citation, LLMClient, LLMQueryResult } from './types';
 
 export class GoogleAIClient implements LLMClient {
   provider = 'GOOGLE' as const;
-  private client: GoogleGenerativeAI;
+  private client: GoogleGenAI;
 
   constructor() {
-    this.client = new GoogleGenerativeAI(process.env.GOOGLE_AI_API_KEY!);
+    this.client = new GoogleGenAI({ apiKey: process.env.GOOGLE_AI_API_KEY! });
   }
 
   async query(prompt: string): Promise<LLMQueryResult> {
     const start = Date.now();
 
     try {
-      // Note: Google Search grounding requires specific API tier access
-      // For now, we use standard generation without grounding
-      // TODO: Enable grounding when available: { tools: [{ googleSearchRetrieval: {} }] }
-      const model = this.client.getGenerativeModel({ model: 'gemini-1.5-pro' });
-      const result = await model.generateContent(prompt);
-      const response = result.response;
+      const response = await this.client.models.generateContent({
+        model: 'gemini-2.0-flash',
+        contents: prompt,
+        config: {
+          tools: [{ googleSearch: {} }],
+        },
+      });
 
-      // Extract citations from grounding metadata if available
+      // Extract citations from grounding metadata
       const citations: Citation[] = [];
       const metadata = response.candidates?.[0]?.groundingMetadata;
+
       if (metadata?.groundingChunks) {
         for (const chunk of metadata.groundingChunks) {
           if (chunk.web?.uri) {
@@ -44,13 +46,17 @@ export class GoogleAIClient implements LLMClient {
         }
       }
 
+      // Count web search queries if available
+      const searchQueries = metadata?.webSearchQueries?.length || 0;
+
       return {
         provider: this.provider,
-        response: response.text(),
+        response: response.text || '',
         citations,
         usage: {
           inputTokens: response.usageMetadata?.promptTokenCount || 0,
           outputTokens: response.usageMetadata?.candidatesTokenCount || 0,
+          searchQueries,
         },
         latencyMs: Date.now() - start,
       };

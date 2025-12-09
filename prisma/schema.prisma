@@ -59,17 +59,19 @@ model VerificationToken {
 }
 
 model Brand {
-  id          String             @id @default(cuid())
-  name        String
-  domain      String
-  industry    String?
-  userId      String
-  user        User               @relation(fields: [userId], references: [id])
-  competitors Competitor[]
-  topics      Topic[]
-  metrics     VisibilityMetric[]
-  createdAt   DateTime           @default(now())
-  updatedAt   DateTime           @updatedAt
+  id                  String               @id @default(cuid())
+  name                String
+  domain              String
+  industry            String?
+  userId              String
+  user                User                 @relation(fields: [userId], references: [id])
+  competitors         Competitor[]
+  topics              Topic[]
+  metrics             VisibilityMetric[]
+  analyticsConnection AnalyticsConnection?
+  aiTrafficData       AITrafficData[]
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
 }
 
 model Competitor {
@@ -154,4 +156,37 @@ enum LLMProvider {
   ANTHROPIC
   GOOGLE
   PERPLEXITY
+}
+
+model AnalyticsConnection {
+  id           String   @id @default(cuid())
+  brandId      String   @unique
+  brand        Brand    @relation(fields: [brandId], references: [id], onDelete: Cascade)
+  provider     String   @default("GA4")
+  propertyId   String
+  accessToken  String
+  refreshToken String
+  expiresAt    DateTime
+  lastSyncAt   DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model AITrafficData {
+  id              String   @id @default(cuid())
+  brandId         String
+  brand           Brand    @relation(fields: [brandId], references: [id], onDelete: Cascade)
+  date            DateTime
+  source          String   // chatgpt.com, claude.ai, perplexity.ai, etc.
+  sessions        Int      @default(0)
+  users           Int      @default(0)
+  engagedSessions Int      @default(0)
+  conversions     Int      @default(0)
+  revenue         Float    @default(0)
+  bounceRate      Float?
+  avgSessionDuration Float?
+  createdAt       DateTime @default(now())
+
+  @@unique([brandId, date, source])
+  @@index([brandId, date])
 }

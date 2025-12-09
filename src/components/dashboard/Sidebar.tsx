@@ -1,7 +1,17 @@
 'use client';
 
 import { cn } from '@/lib/utils';
-import { LayoutDashboard, Link, Menu, MessageSquare, Settings, Users, Zap, X } from 'lucide-react';
+import {
+  BarChart3,
+  LayoutDashboard,
+  Link,
+  Menu,
+  MessageSquare,
+  Settings,
+  Users,
+  Zap,
+  X,
+} from 'lucide-react';
 import NextLink from 'next/link';
 import { useParams, usePathname } from 'next/navigation';
 import { useState } from 'react';
@@ -12,6 +22,7 @@ const navItems = [
   { label: 'Prompts', href: '/prompts', icon: MessageSquare },
   { label: 'Sources', href: '/sources', icon: Link },
   { label: 'Competitors', href: '/competitors', icon: Users },
+  { label: 'Analytics', href: '/analytics', icon: BarChart3 },
   { label: 'Actions', href: '/actions', icon: Zap },
 ];
 
